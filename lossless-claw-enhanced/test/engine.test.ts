@@ -1,0 +1,3567 @@
+import { randomUUID } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import { SessionManager } from "@mariozechner/pi-coding-agent";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { ContextAssembler } from "../src/assembler.js";
+import type { LcmConfig } from "../src/db/config.js";
+import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/connection.js";
+import { LcmContextEngine } from "../src/engine.js";
+import {
+  createDelegatedExpansionGrant,
+  getRuntimeExpansionAuthManager,
+  resetDelegatedExpansionGrantsForTests,
+  resolveDelegatedExpansionGrantId,
+} from "../src/expansion-auth.js";
+import { RetrievalEngine } from "../src/retrieval.js";
+import type { LcmDependencies } from "../src/types.js";
+
+const tempDirs: string[] = [];
+
+function createTestConfig(databasePath: string): LcmConfig {
+  return {
+    enabled: true,
+    databasePath,
+    ignoreSessionPatterns: [],
+    statelessSessionPatterns: [],
+    skipStatelessSessions: true,
+    contextThreshold: 0.75,
+    freshTailCount: 8,
+    leafMinFanout: 8,
+    condensedMinFanout: 4,
+    condensedMinFanoutHard: 2,
+    incrementalMaxDepth: 0,
+    leafChunkTokens: 20_000,
+    leafTargetTokens: 600,
+    condensedTargetTokens: 900,
+    maxExpandTokens: 4000,
+    largeFileTokenThreshold: 25_000,
+    summaryProvider: "",
+    summaryModel: "",
+    largeFileSummaryProvider: "",
+    largeFileSummaryModel: "",
+    autocompactDisabled: false,
+    timezone: "UTC",
+    pruneHeartbeatOk: false,
+  };
+}
+
+function parseAgentSessionKey(sessionKey: string): { agentId: string; suffix: string } | null {
+  const trimmed = sessionKey.trim();
+  if (!trimmed.startsWith("agent:")) {
+    return null;
+  }
+  const parts = trimmed.split(":");
+  if (parts.length < 3) {
+    return null;
+  }
+  return {
+    agentId: parts[1] ?? "main",
+    suffix: parts.slice(2).join(":"),
+  };
+}
+
+function createTestDeps(
+  config: LcmConfig,
+  overrides?: Partial<LcmDependencies>,
+): LcmDependencies {
+  return {
+    config,
+    complete: vi.fn(async () => ({
+      content: [{ type: "text", text: "summary output" }],
+    })),
+    callGateway: vi.fn(async () => ({})),
+    resolveModel: vi.fn(() => ({ provider: "anthropic", model: "claude-opus-4-5" })),
+    getApiKey: vi.fn(async () => process.env.ANTHROPIC_API_KEY),
+    requireApiKey: vi.fn(async () => process.env.ANTHROPIC_API_KEY ?? "test-api-key"),
+    parseAgentSessionKey,
+    isSubagentSessionKey: (sessionKey: string) => sessionKey.includes(":subagent:"),
+    normalizeAgentId: (id?: string) => (id?.trim() ? id : "main"),
+    buildSubagentSystemPrompt: () => "subagent prompt",
+    readLatestAssistantReply: (messages: unknown[]) => {
+      for (let i = messages.length - 1; i >= 0; i -= 1) {
+        const message = messages[i] as { role?: unknown; content?: unknown };
+        if (message.role !== "assistant") {
+          continue;
+        }
+        if (typeof message.content === "string") {
+          return message.content;
+        }
+      }
+      return undefined;
+    },
+    resolveAgentDir: () => process.env.HOME ?? tmpdir(),
+    resolveSessionIdFromSessionKey: async () => undefined,
+    agentLaneSubagent: "subagent",
+    log: {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    },
+    ...overrides,
+  };
+}
+
+function createEngine(): LcmContextEngine {
+  const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+  tempDirs.push(tempDir);
+  const config = createTestConfig(join(tempDir, "lcm.db"));
+  const db = createLcmDatabaseConnection(config.databasePath);
+  return new LcmContextEngine(createTestDeps(config), db);
+}
+
+function createEngineWithDepsOverrides(overrides: Partial<LcmDependencies>): LcmContextEngine {
+  const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+  tempDirs.push(tempDir);
+  const config = createTestConfig(join(tempDir, "lcm.db"));
+  const db = createLcmDatabaseConnection(config.databasePath);
+  return new LcmContextEngine(
+    {
+      ...createTestDeps(config),
+      ...overrides,
+    },
+    db,
+  );
+}
+
+function createEngineAtDatabasePath(databasePath: string): LcmContextEngine {
+  const config = createTestConfig(databasePath);
+  const db = createLcmDatabaseConnection(config.databasePath);
+  return new LcmContextEngine(createTestDeps(config), db);
+}
+
+function createSessionFilePath(name: string): string {
+  const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-session-"));
+  tempDirs.push(tempDir);
+  return join(tempDir, `${name}.jsonl`);
+}
+
+function createEngineWithConfig(overrides: Partial<LcmConfig>): LcmContextEngine {
+  const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+  tempDirs.push(tempDir);
+  const config = {
+    ...createTestConfig(join(tempDir, "lcm.db")),
+    ...overrides,
+  };
+  const db = createLcmDatabaseConnection(config.databasePath);
+  return new LcmContextEngine(createTestDeps(config), db);
+}
+
+function createEngineWithDeps(
+  configOverrides: Partial<LcmConfig>,
+  depOverrides?: Partial<LcmDependencies>,
+): LcmContextEngine {
+  const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+  tempDirs.push(tempDir);
+  const config = {
+    ...createTestConfig(join(tempDir, "lcm.db")),
+    ...configOverrides,
+  };
+  const db = createLcmDatabaseConnection(config.databasePath);
+  return new LcmContextEngine(createTestDeps(config, depOverrides), db);
+}
+
+async function withTempHome<T>(run: (homeDir: string) => Promise<T>): Promise<T> {
+  const originalHome = process.env.HOME;
+  const tempHome = mkdtempSync(join(tmpdir(), "lossless-claw-home-"));
+  tempDirs.push(tempHome);
+  process.env.HOME = tempHome;
+
+  try {
+    return await run(tempHome);
+  } finally {
+    if (originalHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = originalHome;
+    }
+  }
+}
+
+function makeMessage(params: { role?: string; content: unknown }): AgentMessage {
+  return {
+    role: (params.role ?? "assistant") as AgentMessage["role"],
+    content: params.content,
+    timestamp: Date.now(),
+  } as AgentMessage;
+}
+
+function corruptSessionFilePreservingObservedStats(sessionFile: string): void {
+  const originalStats = statSync(sessionFile);
+  writeFileSync(sessionFile, "x".repeat(originalStats.size));
+  const restoredMtime = new Date(originalStats.mtimeMs);
+  utimesSync(sessionFile, restoredMtime, restoredMtime);
+}
+
+function estimateAssembledPayloadTokens(messages: AgentMessage[]): number {
+  let total = 0;
+  for (const message of messages) {
+    if ("content" in message) {
+      if (typeof message.content === "string") {
+        total += Math.ceil(message.content.length / 4);
+        continue;
+      }
+      const serialized = JSON.stringify(message.content);
+      total += Math.ceil((typeof serialized === "string" ? serialized : "").length / 4);
+    }
+  }
+  return total;
+}
+
+async function ingestAndReadStoredContent(params: {
+  engine: LcmContextEngine;
+  sessionId: string;
+  message: AgentMessage;
+}): Promise<string> {
+  await params.engine.ingest({
+    sessionId: params.sessionId,
+    message: params.message,
+  });
+
+  const conversation = await params.engine
+    .getConversationStore()
+    .getConversationBySessionId(params.sessionId);
+  expect(conversation).not.toBeNull();
+
+  const messages = await params.engine
+    .getConversationStore()
+    .getMessages(conversation!.conversationId);
+  expect(messages).toHaveLength(1);
+
+  return messages[0].content;
+}
+
+afterEach(() => {
+  closeLcmConnection();
+  resetDelegatedExpansionGrantsForTests();
+  for (const dir of tempDirs.splice(0)) {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+describe("LcmContextEngine metadata", () => {
+  it("advertises ownsCompaction capability", () => {
+    const engine = createEngine();
+    expect(engine.info.ownsCompaction).toBe(true);
+  });
+
+  it("configures file-backed sqlite connections with WAL and busy_timeout", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-db-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "pragmas.db");
+    const db = createLcmDatabaseConnection(dbPath);
+
+    const journal = db.prepare("PRAGMA journal_mode").get() as { journal_mode?: string };
+    const busy = db.prepare("PRAGMA busy_timeout").get() as { timeout?: number };
+
+    expect(journal.journal_mode).toBe("wal");
+    expect(busy.timeout).toBe(5000);
+  });
+});
+
+describe("LcmContextEngine ignored sessions", () => {
+  const ignoredSessionId = "runtime-ignored-session";
+  const ignoredSessionKey = "agent:main:cron:nightly:run:run-123";
+  const includedSessionId = "runtime-included-session";
+  const includedSessionKey = "agent:main:main";
+
+  it("skips bootstrap for ignored sessions while bootstrapping included sessions", async () => {
+    const sessionFile = createSessionFilePath("ignored-bootstrap");
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "bootstrap me" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "bootstrap reply" }],
+    } as AgentMessage);
+
+    const engine = createEngineWithConfig({
+      ignoreSessionPatterns: ["agent:*:cron:**"],
+    });
+
+    const ignored = await engine.bootstrap({
+      sessionId: ignoredSessionId,
+      sessionKey: ignoredSessionKey,
+      sessionFile,
+    });
+    const included = await engine.bootstrap({
+      sessionId: includedSessionId,
+      sessionKey: includedSessionKey,
+      sessionFile,
+    });
+
+    expect(ignored).toEqual({
+      bootstrapped: false,
+      importedMessages: 0,
+      reason: "session excluded by pattern",
+    });
+    expect(included.bootstrapped).toBe(true);
+    expect(included.importedMessages).toBe(2);
+    expect(
+      await engine.getConversationStore().getConversationBySessionId(ignoredSessionId),
+    ).toBeNull();
+    expect(
+      await engine.getConversationStore().getConversationBySessionId(includedSessionId),
+    ).not.toBeNull();
+  });
+
+  it("skips ingest for ignored sessions while storing included sessions", async () => {
+    const engine = createEngineWithConfig({
+      ignoreSessionPatterns: ["agent:*:cron:**"],
+    });
+
+    const ignored = await engine.ingest({
+      sessionId: ignoredSessionId,
+      sessionKey: ignoredSessionKey,
+      message: makeMessage({ role: "user", content: "drop me" }),
+    });
+    const included = await engine.ingest({
+      sessionId: includedSessionId,
+      sessionKey: includedSessionKey,
+      message: makeMessage({ role: "user", content: "keep me" }),
+    });
+
+    expect(ignored).toEqual({ ingested: false });
+    expect(included).toEqual({ ingested: true });
+    expect(
+      await engine.getConversationStore().getConversationBySessionId(ignoredSessionId),
+    ).toBeNull();
+    expect(
+      await engine.getConversationStore().getConversationBySessionId(includedSessionId),
+    ).not.toBeNull();
+  });
+
+  it("skips ingestBatch for ignored sessions while storing included sessions", async () => {
+    const engine = createEngineWithConfig({
+      ignoreSessionPatterns: ["agent:*:cron:**"],
+    });
+
+    const ignored = await engine.ingestBatch({
+      sessionId: ignoredSessionId,
+      sessionKey: ignoredSessionKey,
+      messages: [
+        makeMessage({ role: "user", content: "drop batch user" }),
+        makeMessage({ role: "assistant", content: "drop batch assistant" }),
+      ],
+    });
+    const included = await engine.ingestBatch({
+      sessionId: includedSessionId,
+      sessionKey: includedSessionKey,
+      messages: [
+        makeMessage({ role: "user", content: "keep batch user" }),
+        makeMessage({ role: "assistant", content: "keep batch assistant" }),
+      ],
+    });
+
+    expect(ignored).toEqual({ ingestedCount: 0 });
+    expect(included).toEqual({ ingestedCount: 2 });
+    expect(
+      await engine.getConversationStore().getConversationBySessionId(ignoredSessionId),
+    ).toBeNull();
+
+    const includedConversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(includedSessionId);
+    expect(includedConversation).not.toBeNull();
+    expect(
+      await engine.getConversationStore().getMessageCount(includedConversation!.conversationId),
+    ).toBe(2);
+  });
+
+  it("skips afterTurn for ignored sessions while persisting included sessions", async () => {
+    const engine = createEngineWithConfig({
+      ignoreSessionPatterns: ["agent:*:cron:**"],
+    });
+
+    await engine.afterTurn({
+      sessionId: ignoredSessionId,
+      sessionKey: ignoredSessionKey,
+      sessionFile: createSessionFilePath("ignored-after-turn"),
+      messages: [makeMessage({ role: "assistant", content: "ignored turn" })],
+      prePromptMessageCount: 0,
+    });
+    await engine.afterTurn({
+      sessionId: includedSessionId,
+      sessionKey: includedSessionKey,
+      sessionFile: createSessionFilePath("included-after-turn"),
+      messages: [makeMessage({ role: "assistant", content: "included turn" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    expect(
+      await engine.getConversationStore().getConversationBySessionId(ignoredSessionId),
+    ).toBeNull();
+
+    const includedConversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(includedSessionId);
+    expect(includedConversation).not.toBeNull();
+
+    const stored = await engine.getConversationStore().getMessages(
+      includedConversation!.conversationId,
+    );
+    expect(stored.map((message) => message.content)).toEqual(["included turn"]);
+  });
+
+  it("passes through assemble for ignored sessions while assembling included sessions from LCM", async () => {
+    const engine = createEngineWithConfig({
+      ignoreSessionPatterns: ["agent:*:cron:**"],
+    });
+
+    await engine.ingest({
+      sessionId: includedSessionId,
+      sessionKey: includedSessionKey,
+      message: makeMessage({ role: "user", content: "persisted context" }),
+    });
+
+    const liveMessages = [makeMessage({ role: "user", content: "live ignored turn" })];
+    const ignored = await engine.assemble({
+      sessionId: ignoredSessionId,
+      sessionKey: ignoredSessionKey,
+      messages: liveMessages,
+      tokenBudget: 500,
+    });
+    const included = await engine.assemble({
+      sessionId: includedSessionId,
+      sessionKey: includedSessionKey,
+      messages: [],
+      tokenBudget: 500,
+    });
+
+    expect(ignored).toEqual({
+      messages: liveMessages,
+      estimatedTokens: 0,
+    });
+    expect(included.messages).toHaveLength(1);
+    expect(included.messages[0]?.content).toBe("persisted context");
+  });
+
+  it("skips compact for ignored sessions while compact still evaluates included sessions", async () => {
+    const engine = createEngineWithConfig({
+      ignoreSessionPatterns: ["agent:*:cron:**"],
+    });
+
+    const ignored = await engine.compact({
+      sessionId: ignoredSessionId,
+      sessionKey: ignoredSessionKey,
+      sessionFile: createSessionFilePath("ignored-compact"),
+      tokenBudget: 1000,
+    });
+
+    await engine.ingest({
+      sessionId: includedSessionId,
+      sessionKey: includedSessionKey,
+      message: makeMessage({ role: "user", content: "compact me maybe" }),
+    });
+    const included = await engine.compact({
+      sessionId: includedSessionId,
+      sessionKey: includedSessionKey,
+      sessionFile: createSessionFilePath("included-compact"),
+      tokenBudget: 1000,
+    });
+
+    expect(ignored).toEqual({
+      ok: true,
+      compacted: false,
+      reason: "session excluded",
+    });
+    expect(included.ok).toBe(true);
+    expect(included.reason).not.toBe("session excluded");
+  });
+
+  it("skips prepareSubagentSpawn for ignored sessions while creating grants for included sessions", async () => {
+    const childSessionKey = "agent:main:subagent:worker-123";
+    const includedParentSessionKey = "agent:main:main";
+    const runtimeSessionId = "runtime-parent-session";
+    const engine = createEngineWithDeps(
+      { ignoreSessionPatterns: ["agent:*:cron:**"] },
+      {
+        resolveSessionIdFromSessionKey: vi.fn(async (sessionKey: string) =>
+          sessionKey === includedParentSessionKey ? runtimeSessionId : undefined,
+        ),
+      },
+    );
+
+    await engine.ingest({
+      sessionId: runtimeSessionId,
+      message: makeMessage({ role: "user", content: "parent context" }),
+    });
+
+    const ignored = await engine.prepareSubagentSpawn({
+      parentSessionKey: ignoredSessionId,
+      childSessionKey,
+    });
+    const included = await engine.prepareSubagentSpawn({
+      parentSessionKey: includedParentSessionKey,
+      childSessionKey,
+    });
+
+    expect(ignored).toBeUndefined();
+    expect(included).toBeDefined();
+    expect(resolveDelegatedExpansionGrantId(childSessionKey)).not.toBeNull();
+
+    included?.rollback();
+    expect(resolveDelegatedExpansionGrantId(childSessionKey)).toBeNull();
+  });
+
+  it("skips onSubagentEnded for ignored sessions while cleaning up included child grants", async () => {
+    const ignoredChildSessionKey = "agent:main:cron:child";
+    const includedChildSessionKey = "agent:main:subagent:child";
+    createDelegatedExpansionGrant({
+      delegatedSessionKey: ignoredChildSessionKey,
+      issuerSessionId: "issuer-1",
+      allowedConversationIds: [1],
+    });
+    createDelegatedExpansionGrant({
+      delegatedSessionKey: includedChildSessionKey,
+      issuerSessionId: "issuer-2",
+      allowedConversationIds: [2],
+    });
+
+    const engine = createEngineWithConfig({
+      ignoreSessionPatterns: ["agent:*:cron:**"],
+    });
+
+    await engine.onSubagentEnded({
+      childSessionKey: ignoredChildSessionKey,
+      reason: "deleted",
+    });
+    await engine.onSubagentEnded({
+      childSessionKey: includedChildSessionKey,
+      reason: "deleted",
+    });
+
+    expect(resolveDelegatedExpansionGrantId(ignoredChildSessionKey)).not.toBeNull();
+    expect(resolveDelegatedExpansionGrantId(includedChildSessionKey)).toBeNull();
+    expect(
+      getRuntimeExpansionAuthManager().getGrant(
+        resolveDelegatedExpansionGrantId(ignoredChildSessionKey)!,
+      ),
+    ).not.toBeNull();
+  });
+});
+
+describe("LcmContextEngine stateless sessions", () => {
+  const statelessSessionKey = "agent:main:subagent:worker-preview";
+  const statefulSessionKey = "agent:main:main";
+  const runtimeSessionId = "runtime-stateless-session";
+  const statefulRuntimeSessionId = "runtime-stateful-session";
+
+  it("matches stateless patterns on sessionKey and can be disabled globally", () => {
+    const enabledEngine = createEngineWithConfig({
+      statelessSessionPatterns: ["agent:*:subagent:worker-*"],
+    });
+    const disabledEngine = createEngineWithConfig({
+      statelessSessionPatterns: ["agent:*:subagent:worker-*"],
+      skipStatelessSessions: false,
+    });
+
+    expect(enabledEngine.isStatelessSession(statelessSessionKey)).toBe(true);
+    expect(enabledEngine.isStatelessSession(statefulSessionKey)).toBe(false);
+    expect(disabledEngine.isStatelessSession(statelessSessionKey)).toBe(false);
+  });
+
+  it("skips bootstrap persistence for stateless session keys", async () => {
+    const sessionFile = createSessionFilePath("stateless-bootstrap");
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "bootstrap me" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "bootstrap reply" }],
+    } as AgentMessage);
+
+    const engine = createEngineWithConfig({
+      statelessSessionPatterns: ["agent:*:subagent:worker-*"],
+    });
+
+    const stateless = await engine.bootstrap({
+      sessionId: runtimeSessionId,
+      sessionKey: statelessSessionKey,
+      sessionFile,
+    });
+
+    const stateful = await engine.bootstrap({
+      sessionId: statefulRuntimeSessionId,
+      sessionKey: statefulSessionKey,
+      sessionFile,
+    });
+
+    expect(stateless).toEqual({
+      bootstrapped: false,
+      importedMessages: 0,
+      reason: "stateless session",
+    });
+    expect(
+      await engine.getConversationStore().getConversationBySessionId(runtimeSessionId),
+    ).toBeNull();
+    expect(stateful.bootstrapped).toBe(true);
+    expect(stateful.importedMessages).toBe(2);
+  });
+
+  it("skips ingest and ingestBatch writes for stateless session keys", async () => {
+    const engine = createEngineWithConfig({
+      statelessSessionPatterns: ["agent:*:subagent:worker-*"],
+    });
+
+    const ingested = await engine.ingest({
+      sessionId: runtimeSessionId,
+      sessionKey: statelessSessionKey,
+      message: makeMessage({ role: "user", content: "drop me" }),
+    });
+    const batched = await engine.ingestBatch({
+      sessionId: runtimeSessionId,
+      sessionKey: statelessSessionKey,
+      messages: [
+        makeMessage({ role: "user", content: "drop batch user" }),
+        makeMessage({ role: "assistant", content: "drop batch assistant" }),
+      ],
+    });
+    const included = await engine.ingest({
+      sessionId: runtimeSessionId,
+      sessionKey: statefulSessionKey,
+      message: makeMessage({ role: "user", content: "keep me" }),
+    });
+
+    expect(ingested).toEqual({ ingested: false });
+    expect(batched).toEqual({ ingestedCount: 0 });
+    expect(included).toEqual({ ingested: true });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(runtimeSessionId);
+    expect(conversation).not.toBeNull();
+    expect(
+      await engine.getConversationStore().getMessageCount(conversation!.conversationId),
+    ).toBe(1);
+  });
+
+  it("skips ingest for assistant messages with stopReason error and empty content", async () => {
+    const engine = createEngine();
+    const sessionId = randomUUID();
+    const sessionKey = "agent:poppy:main";
+
+    // Ingest a normal user message first
+    const userResult = await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "user", content: "ping" }),
+    });
+    expect(userResult).toEqual({ ingested: true });
+
+    // Ingest an error assistant message with empty content array
+    const errorResult = await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: {
+        role: "assistant" as AgentMessage["role"],
+        content: [],
+        stopReason: "error",
+        timestamp: Date.now(),
+      } as AgentMessage,
+    });
+    expect(errorResult).toEqual({ ingested: false });
+
+    // Ingest an error assistant message with empty string content
+    const errorResult2 = await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: {
+        role: "assistant" as AgentMessage["role"],
+        content: "",
+        stopReason: "error",
+        timestamp: Date.now(),
+      } as AgentMessage,
+    });
+    expect(errorResult2).toEqual({ ingested: false });
+
+    // Ingest an aborted assistant message with no content
+    const abortedResult = await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: {
+        role: "assistant" as AgentMessage["role"],
+        content: [],
+        stopReason: "aborted",
+        timestamp: Date.now(),
+      } as AgentMessage,
+    });
+    expect(abortedResult).toEqual({ ingested: false });
+
+    // A normal assistant message should still be ingested
+    const normalResult = await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "assistant", content: "pong" }),
+    });
+    expect(normalResult).toEqual({ ingested: true });
+
+    // An error assistant with actual content should still be ingested
+    const errorWithContentResult = await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: {
+        role: "assistant" as AgentMessage["role"],
+        content: [{ type: "text", text: "Partial response before error" }],
+        stopReason: "error",
+        timestamp: Date.now(),
+      } as AgentMessage,
+    });
+    expect(errorWithContentResult).toEqual({ ingested: true });
+
+    // Verify only the 3 valid messages were stored (user + normal assistant + error-with-content)
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    expect(
+      await engine.getConversationStore().getMessageCount(conversation!.conversationId),
+    ).toBe(3);
+  });
+
+  it("allows assemble reads for stateless session keys", async () => {
+    const engine = createEngineWithConfig({
+      statelessSessionPatterns: ["agent:*:subagent:worker-*"],
+    });
+
+    await engine.ingest({
+      sessionId: runtimeSessionId,
+      sessionKey: statefulSessionKey,
+      message: makeMessage({ role: "user", content: "persisted context" }),
+    });
+
+    const assembled = await engine.assemble({
+      sessionId: runtimeSessionId,
+      sessionKey: statelessSessionKey,
+      messages: [],
+      tokenBudget: 500,
+    });
+
+    expect(assembled.messages).toHaveLength(1);
+    expect(assembled.messages[0]?.content).toBe("persisted context");
+  });
+
+  it("skips afterTurn and compact writes for stateless session keys", async () => {
+    const engine = createEngineWithConfig({
+      statelessSessionPatterns: ["agent:*:subagent:worker-*"],
+    });
+
+    await engine.afterTurn({
+      sessionId: runtimeSessionId,
+      sessionKey: statelessSessionKey,
+      sessionFile: createSessionFilePath("stateless-after-turn"),
+      messages: [makeMessage({ role: "assistant", content: "ignored turn" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 1000,
+    });
+
+    await engine.ingest({
+      sessionId: runtimeSessionId,
+      sessionKey: statefulSessionKey,
+      message: makeMessage({ role: "user", content: "persisted context" }),
+    });
+
+    const compactResult = await engine.compact({
+      sessionId: runtimeSessionId,
+      sessionKey: statelessSessionKey,
+      sessionFile: createSessionFilePath("stateless-compact"),
+      tokenBudget: 1000,
+    });
+
+    expect(compactResult).toEqual({
+      ok: true,
+      compacted: false,
+      reason: "stateless session",
+    });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(runtimeSessionId);
+    expect(conversation).not.toBeNull();
+    expect(
+      await engine.getConversationStore().getMessageCount(conversation!.conversationId),
+    ).toBe(1);
+  });
+
+  it("skips delegated grant writes for stateless session keys", async () => {
+    const childSessionKey = "agent:main:subagent:child-456";
+    const engine = createEngineWithDeps(
+      { statelessSessionPatterns: ["agent:*:subagent:worker-*"] },
+      {
+        resolveSessionIdFromSessionKey: vi.fn(async (sessionKey: string) =>
+          sessionKey === statefulSessionKey ? runtimeSessionId : undefined,
+        ),
+      },
+    );
+
+    await engine.ingest({
+      sessionId: runtimeSessionId,
+      sessionKey: statefulSessionKey,
+      message: makeMessage({ role: "user", content: "parent context" }),
+    });
+
+    const skipped = await engine.prepareSubagentSpawn({
+      parentSessionKey: statelessSessionKey,
+      childSessionKey,
+    });
+    const included = await engine.prepareSubagentSpawn({
+      parentSessionKey: statefulSessionKey,
+      childSessionKey,
+    });
+
+    expect(skipped).toBeUndefined();
+    expect(resolveDelegatedExpansionGrantId(childSessionKey)).not.toBeNull();
+
+    included?.rollback();
+    expect(resolveDelegatedExpansionGrantId(childSessionKey)).toBeNull();
+  });
+
+  it("skips subagent cleanup for stateless child session keys", async () => {
+    const childSessionKey = statelessSessionKey;
+    createDelegatedExpansionGrant({
+      delegatedSessionKey: childSessionKey,
+      issuerSessionId: "issuer-1",
+      allowedConversationIds: [1],
+    });
+
+    const engine = createEngineWithConfig({
+      statelessSessionPatterns: ["agent:*:subagent:worker-*"],
+    });
+
+    await engine.onSubagentEnded({
+      childSessionKey,
+      reason: "deleted",
+    });
+
+    expect(resolveDelegatedExpansionGrantId(childSessionKey)).not.toBeNull();
+  });
+});
+
+describe("ConversationStore session reuse", () => {
+  it("reuses conversation across session resets when sessionKey matches", async () => {
+    const engine = createEngine();
+    (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
+    const store = engine.getConversationStore();
+
+    const conv1 = await store.getOrCreateConversation("uuid-1", { sessionKey: "agent:main:main" });
+    const conv2 = await store.getOrCreateConversation("uuid-2", { sessionKey: "agent:main:main" });
+
+    expect(conv2.conversationId).toBe(conv1.conversationId);
+
+    const refreshed = await store.getConversation(conv1.conversationId);
+    expect(refreshed?.sessionId).toBe("uuid-2");
+  });
+});
+
+describe("LcmContextEngine delegated session continuity", () => {
+  it("prepares subagent spawn from an existing conversation found by sessionKey", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+    tempDirs.push(tempDir);
+    const config = createTestConfig(join(tempDir, "lcm.db"));
+    const db = createLcmDatabaseConnection(config.databasePath);
+    const deps = createTestDeps(config);
+    deps.resolveSessionIdFromSessionKey = vi.fn(async () => "uuid-after-reset");
+    const engine = new LcmContextEngine(deps, db);
+
+    (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
+    await engine
+      .getConversationStore()
+      .getOrCreateConversation("uuid-before-reset", { sessionKey: "agent:main:main" });
+
+    const prepared = await engine.prepareSubagentSpawn({
+      parentSessionKey: "agent:main:main",
+      childSessionKey: "agent:main:subagent:child",
+    });
+
+    expect(prepared).toBeDefined();
+  });
+});
+
+// ── Ingest content extraction ───────────────────────────────────────────────
+
+describe("LcmContextEngine.ingest content extraction", () => {
+  it("stores string content as-is", async () => {
+    const engine = createEngine();
+    const sessionId = randomUUID();
+    const content = await ingestAndReadStoredContent({
+      engine,
+      sessionId,
+      message: makeMessage({ role: "user", content: "hello world" }),
+    });
+
+    expect(content).toBe("hello world");
+  });
+
+  it("flattens text content block arrays to plain text", async () => {
+    const engine = createEngine();
+    const sessionId = randomUUID();
+    const content = await ingestAndReadStoredContent({
+      engine,
+      sessionId,
+      message: makeMessage({
+        content: [{ type: "text", text: "hello" }],
+      }),
+    });
+
+    expect(content).toBe("hello");
+  });
+
+  it("extracts only text blocks from mixed content arrays", async () => {
+    const engine = createEngine();
+    const sessionId = randomUUID();
+    const content = await ingestAndReadStoredContent({
+      engine,
+      sessionId,
+      message: makeMessage({
+        content: [
+          { type: "text", text: "line one" },
+          { type: "thinking", thinking: "internal chain of thought" },
+          { type: "tool_use", name: "bash" },
+          { type: "text", text: "line two" },
+        ],
+      }),
+    });
+
+    expect(content).toBe("line one\nline two");
+  });
+
+  it("stores empty string for empty content arrays", async () => {
+    const engine = createEngine();
+    const sessionId = randomUUID();
+    const content = await ingestAndReadStoredContent({
+      engine,
+      sessionId,
+      message: makeMessage({ content: [] }),
+    });
+
+    expect(content).toBe("");
+  });
+
+  it("falls back to JSON.stringify for non-array, non-string content", async () => {
+    const engine = createEngine();
+    const sessionId = randomUUID();
+    const content = await ingestAndReadStoredContent({
+      engine,
+      sessionId,
+      message: makeMessage({ content: { status: "ok", count: 2 } }),
+    });
+
+    expect(content).toBe('{"status":"ok","count":2}');
+  });
+
+  it("roundtrip stores plain text, not JSON content blocks", async () => {
+    const engine = createEngine();
+    const sessionId = randomUUID();
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({
+        content: [{ type: "text", text: "HEARTBEAT_OK" }],
+      }),
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const storedMessages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(storedMessages).toHaveLength(1);
+    expect(storedMessages[0].content).toBe("HEARTBEAT_OK");
+    expect(storedMessages[0].content).not.toContain('{"type":"text"');
+  });
+
+  it("intercepts oversized <file> blocks and persists large file metadata", async () => {
+    await withTempHome(async () => {
+      const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+      const sessionId = randomUUID();
+      const fileText = `${"line about architecture\n".repeat(160)}closing notes`;
+      const messageContent = `<file name="lcm-paper.md" mime="text/markdown">${fileText}</file>`;
+
+      await engine.ingest({
+        sessionId,
+        message: makeMessage({ role: "user", content: messageContent }),
+      });
+
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+
+      const messages = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(messages).toHaveLength(1);
+      expect(messages[0].content).toContain("[LCM File: file_");
+      expect(messages[0].content).toContain("Exploration Summary:");
+      expect(messages[0].content).not.toContain("<file name=");
+
+      const fileIdMatch = messages[0].content.match(/file_[a-f0-9]{16}/);
+      expect(fileIdMatch).not.toBeNull();
+      const fileId = fileIdMatch![0];
+
+      const storedFile = await engine.getSummaryStore().getLargeFile(fileId);
+      expect(storedFile).not.toBeNull();
+      expect(storedFile!.fileName).toBe("lcm-paper.md");
+      expect(storedFile!.mimeType).toBe("text/markdown");
+      expect(storedFile!.storageUri).toContain(
+        `.openclaw/lcm-files/${conversation!.conversationId}/`,
+      );
+      expect(readFileSync(storedFile!.storageUri, "utf8")).toBe(fileText);
+
+      const parts = await engine.getConversationStore().getMessageParts(messages[0].messageId);
+      expect(parts).toHaveLength(1);
+      expect(parts[0].textContent).toContain("[LCM File: file_");
+      expect(parts[0].textContent).not.toContain("<file name=");
+    });
+  });
+
+  it("keeps <file> blocks inline when below the large-file threshold", async () => {
+    await withTempHome(async () => {
+      const engine = createEngineWithConfig({ largeFileTokenThreshold: 100_000 });
+      const sessionId = randomUUID();
+      const messageContent = '<file name="small.json" mime="application/json">{"ok":true}</file>';
+
+      await engine.ingest({
+        sessionId,
+        message: makeMessage({ role: "user", content: messageContent }),
+      });
+
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+
+      const messages = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(messages).toHaveLength(1);
+      expect(messages[0].content).toBe(messageContent);
+
+      const largeFiles = await engine
+        .getSummaryStore()
+        .getLargeFilesByConversation(conversation!.conversationId);
+      expect(largeFiles).toHaveLength(0);
+    });
+  });
+
+  it("externalizes oversized tool-result payloads into large_files", async () => {
+    await withTempHome(async () => {
+      const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+      const sessionId = randomUUID();
+      const toolOutput = `${"tool output line\n".repeat(160)}done`;
+
+      await engine.ingest({
+        sessionId,
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "toolCall",
+              id: "call_externalized",
+              name: "exec",
+              input: { cmd: "pwd" },
+            },
+          ],
+        } as AgentMessage,
+      });
+
+      await engine.ingest({
+        sessionId,
+        message: {
+          role: "toolResult",
+          toolCallId: "call_externalized",
+          toolName: "exec",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "call_externalized",
+              name: "exec",
+              content: [{ type: "text", text: toolOutput }],
+            },
+          ],
+        } as AgentMessage,
+      });
+
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+
+      const storedMessages = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(storedMessages).toHaveLength(2);
+      expect(storedMessages[1].content).toContain("[LCM Tool Output: file_");
+      expect(storedMessages[1].content).toContain("tool=exec");
+      expect(storedMessages[1].content).not.toContain(toolOutput.slice(0, 64));
+
+      const fileIdMatch = storedMessages[1].content.match(/file_[a-f0-9]{16}/);
+      expect(fileIdMatch).not.toBeNull();
+      const fileId = fileIdMatch![0];
+
+      const storedFile = await engine.getSummaryStore().getLargeFile(fileId);
+      expect(storedFile).not.toBeNull();
+      expect(storedFile!.fileName).toBe("exec.txt");
+      expect(storedFile!.mimeType).toBe("text/plain");
+      expect(readFileSync(storedFile!.storageUri, "utf8")).toBe(toolOutput);
+
+      const parts = await engine.getConversationStore().getMessageParts(storedMessages[1].messageId);
+      expect(parts).toHaveLength(1);
+      expect(parts[0].partType).toBe("tool");
+      const metadata = JSON.parse(parts[0].metadata ?? "{}") as Record<string, unknown>;
+      expect(metadata).toMatchObject({
+        externalizedFileId: fileId,
+        originalByteSize: Buffer.byteLength(toolOutput, "utf8"),
+        toolOutputExternalized: true,
+        externalizationReason: "large_tool_result",
+      });
+
+      const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
+      const assembled = await assembler.assemble({
+        conversationId: conversation!.conversationId,
+        tokenBudget: 10_000,
+      });
+      expect(assembled.messages).toHaveLength(2);
+      const assembledToolResult = assembled.messages[1] as {
+        role: string;
+        content?: Array<{ output?: unknown }>;
+      };
+      expect(assembledToolResult.role).toBe("toolResult");
+      expect(typeof assembledToolResult.content?.[0]?.output).toBe("string");
+      expect(String(assembledToolResult.content?.[0]?.output)).toContain(fileId);
+
+      const retrieval = new RetrievalEngine(
+        engine.getConversationStore(),
+        engine.getSummaryStore(),
+      );
+      const described = await retrieval.describe(fileId);
+      expect(described?.type).toBe("file");
+      expect(described?.file?.storageUri).toBe(storedFile!.storageUri);
+
+      const searchable = await engine.getConversationStore().searchMessages({
+        conversationId: conversation!.conversationId,
+        query: "exec",
+        mode: "full_text",
+      });
+      expect(searchable).toHaveLength(1);
+
+      const noisy = await engine.getConversationStore().searchMessages({
+        conversationId: conversation!.conversationId,
+        query: "lcm_describe",
+        mode: "full_text",
+      });
+      expect(noisy).toHaveLength(0);
+    });
+  });
+
+  it("externalizes oversized plain-text tool-result blocks from live exec-style messages", async () => {
+    await withTempHome(async () => {
+      const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+      const sessionId = randomUUID();
+      const toolOutput = `${"minified js chunk\n".repeat(160)}done`;
+
+      await engine.ingest({
+        sessionId,
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "toolCall",
+              id: "call_live_exec",
+              name: "exec",
+              input: { cmd: "head -c 200000 viewer-runtime.js" },
+            },
+          ],
+        } as AgentMessage,
+      });
+
+      await engine.ingest({
+        sessionId,
+        message: {
+          role: "toolResult",
+          toolCallId: "call_live_exec",
+          toolName: "exec",
+          isError: false,
+          content: [
+            {
+              type: "text",
+              text: toolOutput,
+            },
+          ],
+        } as AgentMessage,
+      });
+
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+
+      const storedMessages = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(storedMessages).toHaveLength(2);
+      expect(storedMessages[1].content).toContain("[LCM Tool Output: file_");
+      expect(storedMessages[1].content).toContain("tool=exec");
+      expect(storedMessages[1].content).not.toContain(toolOutput.slice(0, 64));
+
+      const fileIdMatch = storedMessages[1].content.match(/file_[a-f0-9]{16}/);
+      expect(fileIdMatch).not.toBeNull();
+      const fileId = fileIdMatch![0];
+
+      const storedFile = await engine.getSummaryStore().getLargeFile(fileId);
+      expect(storedFile).not.toBeNull();
+      expect(storedFile!.fileName).toBe("exec.txt");
+      expect(readFileSync(storedFile!.storageUri, "utf8")).toBe(toolOutput);
+
+      const parts = await engine.getConversationStore().getMessageParts(storedMessages[1].messageId);
+      expect(parts).toHaveLength(1);
+      expect(parts[0].partType).toBe("tool");
+      expect(parts[0].toolCallId).toBe("call_live_exec");
+      expect(parts[0].toolName).toBe("exec");
+      const metadata = JSON.parse(parts[0].metadata ?? "{}") as Record<string, unknown>;
+      expect(metadata).toMatchObject({
+        originalRole: "toolResult",
+        rawType: "tool_result",
+        externalizedFileId: fileId,
+        originalByteSize: Buffer.byteLength(toolOutput, "utf8"),
+        toolOutputExternalized: true,
+        externalizationReason: "large_tool_result",
+      });
+
+      const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
+      const assembled = await assembler.assemble({
+        conversationId: conversation!.conversationId,
+        tokenBudget: 10_000,
+      });
+      expect(assembled.messages).toHaveLength(2);
+      const assembledToolResult = assembled.messages[1] as {
+        role: string;
+        toolCallId?: string;
+        toolName?: string;
+        content?: Array<{ output?: unknown }>;
+      };
+      expect(assembledToolResult.role).toBe("toolResult");
+      expect(assembledToolResult.toolCallId).toBe("call_live_exec");
+      expect(assembledToolResult.toolName).toBe("exec");
+      expect(typeof assembledToolResult.content?.[0]?.output).toBe("string");
+      expect(String(assembledToolResult.content?.[0]?.output)).toContain(fileId);
+    });
+  });
+
+  it("serializes recycled session writes by stable sessionKey", async () => {
+    const engine = createEngine();
+    const sessionKey = "agent:main:main";
+
+    await engine.ingest({
+      sessionId: "runtime-seed",
+      sessionKey,
+      message: makeMessage({ role: "assistant", content: "seed" }),
+    });
+
+    const store = engine.getConversationStore();
+    const originalCreateMessage = store.createMessage.bind(store);
+    let releaseFirstCreate: () => void = () => {};
+    let unblockFirstCreate!: () => void;
+    const firstCreateBlocked = new Promise<void>((resolve) => {
+      unblockFirstCreate = resolve;
+    });
+    let heldFirstCreate = false;
+
+    const createMessageSpy = vi
+      .spyOn(store, "createMessage")
+      .mockImplementation(async (input) => {
+        if (!heldFirstCreate) {
+          heldFirstCreate = true;
+          unblockFirstCreate();
+          await new Promise<void>((resolve) => {
+            releaseFirstCreate = resolve;
+          });
+        }
+        return originalCreateMessage(input);
+      });
+
+    const firstIngest = engine.ingest({
+      sessionId: "runtime-a",
+      sessionKey,
+      message: makeMessage({ role: "assistant", content: "first recycled reply" }),
+    });
+    await firstCreateBlocked;
+
+    const secondIngest = engine.ingest({
+      sessionId: "runtime-b",
+      sessionKey,
+      message: makeMessage({ role: "assistant", content: "second recycled reply" }),
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(createMessageSpy).toHaveBeenCalledTimes(1);
+
+    releaseFirstCreate();
+
+    await expect(Promise.all([firstIngest, secondIngest])).resolves.toEqual([
+      { ingested: true },
+      { ingested: true },
+    ]);
+
+    const conversation = await store.getConversationBySessionKey(sessionKey);
+    expect(conversation).not.toBeNull();
+    expect(conversation!.sessionId).toBe("runtime-b");
+
+    const stored = await store.getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "seed",
+      "first recycled reply",
+      "second recycled reply",
+    ]);
+  });
+});
+
+describe("LcmContextEngine connection lifecycle", () => {
+  it("keeps shared sqlite handle open while another engine instance is active", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-shared-db-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "lcm.db");
+
+    const engineA = createEngineAtDatabasePath(dbPath);
+    const engineB = createEngineAtDatabasePath(dbPath);
+    const sessionId = randomUUID();
+
+    await engineA.ingest({
+      sessionId,
+      message: makeMessage({ role: "user", content: "first" }),
+    });
+
+    await engineA.dispose();
+
+    await expect(
+      engineB.ingest({
+        sessionId,
+        message: makeMessage({ role: "assistant", content: "second" }),
+      }),
+    ).resolves.toEqual({ ingested: true });
+  });
+});
+
+// ── Bootstrap ───────────────────────────────────────────────────────────────
+
+describe("LcmContextEngine.bootstrap", () => {
+  it("imports only active leaf-path messages from SessionManager context", async () => {
+    const sessionFile = createSessionFilePath("branched");
+    const sm = SessionManager.open(sessionFile);
+
+    const rootUserId = sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "root user" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "abandoned assistant" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "abandoned user" }],
+    } as AgentMessage);
+
+    // Re-branch from the first user entry so prior turns are abandoned.
+    sm.branch(rootUserId);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "active assistant" }],
+    } as AgentMessage);
+
+    const engine = createEngine();
+    const sessionId = "bootstrap-leaf-path";
+    const result = await engine.bootstrap({ sessionId, sessionFile });
+
+    expect(result.bootstrapped).toBe(true);
+    expect(result.importedMessages).toBe(4);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    expect(conversation!.bootstrappedAt).not.toBeNull();
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(4);
+    expect(stored.map((m) => m.content)).toEqual([
+      "root user",
+      "abandoned assistant",
+      "abandoned user",
+      "active assistant",
+    ]);
+
+    const contextItems = await engine
+      .getSummaryStore()
+      .getContextItems(conversation!.conversationId);
+    expect(contextItems).toHaveLength(4);
+    expect(contextItems.every((item) => item.itemType === "message")).toBe(true);
+
+    const bootstrapState = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    const sessionFileStats = statSync(sessionFile);
+    expect(bootstrapState).not.toBeNull();
+    expect(bootstrapState?.sessionFilePath).toBe(sessionFile);
+    expect(bootstrapState?.lastSeenSize).toBe(sessionFileStats.size);
+    expect(bootstrapState?.lastSeenMtimeMs).toBe(Math.trunc(sessionFileStats.mtimeMs));
+    expect(bootstrapState?.lastProcessedOffset).toBe(sessionFileStats.size);
+    expect(bootstrapState?.lastProcessedEntryHash).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it("is idempotent and does not duplicate already bootstrapped sessions", async () => {
+    const sessionFile = createSessionFilePath("idempotent");
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "first" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "second" }],
+    } as AgentMessage);
+
+    const engine = createEngine();
+    const sessionId = "bootstrap-idempotent";
+
+    const first = await engine.bootstrap({ sessionId, sessionFile });
+    const second = await engine.bootstrap({ sessionId, sessionFile });
+
+    expect(first.bootstrapped).toBe(true);
+    expect(first.importedMessages).toBe(2);
+    expect(second.bootstrapped).toBe(false);
+    expect(second.importedMessages).toBe(0);
+    expect(second.reason).toBe("already bootstrapped");
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    expect(await engine.getConversationStore().getMessageCount(conversation!.conversationId)).toBe(
+      2,
+    );
+  });
+
+  it("skips reopening the transcript when checkpoint stats match", async () => {
+    const sessionFile = createSessionFilePath("unchanged-fast-path");
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "first" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "second" }],
+    } as AgentMessage);
+
+    const engine = createEngine();
+    const sessionId = "bootstrap-unchanged-fast-path";
+
+    const first = await engine.bootstrap({ sessionId, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+    expect(first.importedMessages).toBe(2);
+
+    corruptSessionFilePreservingObservedStats(sessionFile);
+
+    const second = await engine.bootstrap({ sessionId, sessionFile });
+    expect(second.bootstrapped).toBe(false);
+    expect(second.importedMessages).toBe(0);
+    expect(second.reason).toBe("already bootstrapped");
+  });
+
+  it("preserves ordinary bootstrap behavior when no checkpoint exists", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "lcm.db");
+    const sessionFile = createSessionFilePath("missing-checkpoint");
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "first" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "second" }],
+    } as AgentMessage);
+
+    const engine = createEngineAtDatabasePath(dbPath);
+    const sessionId = "bootstrap-missing-checkpoint";
+
+    const first = await engine.bootstrap({ sessionId, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const rawDb = createLcmDatabaseConnection(dbPath);
+    try {
+      rawDb
+        .prepare(`DELETE FROM conversation_bootstrap_state WHERE conversation_id = ?`)
+        .run(conversation!.conversationId);
+      rawDb
+        .prepare(`UPDATE conversations SET bootstrapped_at = NULL WHERE conversation_id = ?`)
+        .run(conversation!.conversationId);
+    } finally {
+      closeLcmConnection(rawDb);
+    }
+
+    corruptSessionFilePreservingObservedStats(sessionFile);
+
+    await expect(engine.bootstrap({ sessionId, sessionFile })).resolves.toEqual({
+      bootstrapped: false,
+      importedMessages: 0,
+      reason: "conversation already has messages",
+    });
+  });
+
+  it("reconciles missing tail messages when JSONL advanced past LCM", async () => {
+    const sessionFile = createSessionFilePath("reconcile-tail");
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "seed user" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "seed assistant" }],
+    } as AgentMessage);
+
+    const engine = createEngine();
+    const sessionId = "bootstrap-reconcile-tail";
+
+    const first = await engine.bootstrap({ sessionId, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+    expect(first.importedMessages).toBe(2);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const firstBootstrapState = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(firstBootstrapState).not.toBeNull();
+
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "lost user turn" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "lost assistant turn" }],
+    } as AgentMessage);
+
+    const second = await engine.bootstrap({ sessionId, sessionFile });
+    expect(second.bootstrapped).toBe(true);
+    expect(second.importedMessages).toBe(2);
+    expect(second.reason).toBe("reconciled missing session messages");
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "seed user",
+      "seed assistant",
+      "lost user turn",
+      "lost assistant turn",
+    ]);
+
+    const bootstrapState = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    const sessionFileStats = statSync(sessionFile);
+    expect(bootstrapState).not.toBeNull();
+    expect(bootstrapState?.lastSeenSize).toBe(sessionFileStats.size);
+    expect(bootstrapState?.lastSeenMtimeMs).toBe(Math.trunc(sessionFileStats.mtimeMs));
+    expect(bootstrapState?.lastProcessedOffset).toBe(sessionFileStats.size);
+    expect(bootstrapState?.lastProcessedEntryHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(bootstrapState?.lastSeenSize).toBeGreaterThan(firstBootstrapState!.lastSeenSize);
+    expect(bootstrapState?.lastProcessedEntryHash).not.toBe(firstBootstrapState!.lastProcessedEntryHash);
+  });
+
+  it("imports appended tail messages without replaying full reconciliation", async () => {
+    const sessionFile = createSessionFilePath("append-only-tail");
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "seed user" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "seed assistant" }],
+    } as AgentMessage);
+
+    const engine = createEngine();
+    const sessionId = "bootstrap-append-only-tail";
+
+    const first = await engine.bootstrap({ sessionId, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+    expect(first.importedMessages).toBe(2);
+
+    const reconcileSpy = vi.spyOn(engine as any, "reconcileSessionTail");
+
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "tail user" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "tail assistant" }],
+    } as AgentMessage);
+
+    const second = await engine.bootstrap({ sessionId, sessionFile });
+    expect(second).toEqual({
+      bootstrapped: true,
+      importedMessages: 2,
+      reason: "reconciled missing session messages",
+    });
+    expect(reconcileSpy).not.toHaveBeenCalled();
+  });
+
+  it("falls back to full reconciliation when append-only checkpoint validation mismatches", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "lcm.db");
+    const sessionFile = createSessionFilePath("append-only-mismatch");
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "seed user" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "seed assistant" }],
+    } as AgentMessage);
+
+    const engine = createEngineAtDatabasePath(dbPath);
+    const sessionId = "bootstrap-append-only-mismatch";
+
+    const first = await engine.bootstrap({ sessionId, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const rawDb = createLcmDatabaseConnection(dbPath);
+    try {
+      rawDb
+        .prepare(
+          `UPDATE conversation_bootstrap_state
+           SET last_processed_entry_hash = ?
+           WHERE conversation_id = ?`,
+        )
+        .run("mismatch", conversation!.conversationId);
+    } finally {
+      closeLcmConnection(rawDb);
+    }
+
+    const reconcileSpy = vi.spyOn(engine as any, "reconcileSessionTail");
+
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "tail user" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "tail assistant" }],
+    } as AgentMessage);
+
+    const second = await engine.bootstrap({ sessionId, sessionFile });
+    expect(second).toEqual({
+      bootstrapped: true,
+      importedMessages: 2,
+      reason: "reconciled missing session messages",
+    });
+    expect(reconcileSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("reconciles missing structured tool-call tail when prior empty tool content exists", async () => {
+    const sessionFile = createSessionFilePath("reconcile-tool-tail");
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "seed user" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "seed assistant" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "toolCall", id: "call_existing", name: "read", input: { path: "a.txt" } }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "toolResult",
+      toolCallId: "call_existing",
+      content: [{ type: "tool_result", tool_use_id: "call_existing", output: { ok: true } }],
+    } as AgentMessage);
+
+    const engine = createEngine();
+    const sessionId = "bootstrap-reconcile-tool-tail";
+
+    const first = await engine.bootstrap({ sessionId, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+    expect(first.importedMessages).toBe(4);
+
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "toolCall", id: "call_missing", name: "read", input: { path: "b.txt" } }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "toolResult",
+      toolCallId: "call_missing",
+      content: [{ type: "tool_result", tool_use_id: "call_missing", output: { ok: true } }],
+    } as AgentMessage);
+
+    const second = await engine.bootstrap({ sessionId, sessionFile });
+    expect(second.bootstrapped).toBe(true);
+    expect(second.importedMessages).toBe(2);
+    expect(second.reason).toBe("reconciled missing session messages");
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(6);
+    expect(stored[4].role).toBe("assistant");
+    expect(stored[4].content).toBe("");
+    expect(stored[5].role).toBe("tool");
+    expect(stored[5].content).toBe("");
+  });
+
+  it("does not append JSONL when no overlapping anchor exists in LCM", async () => {
+    const sessionFile = createSessionFilePath("reconcile-no-overlap");
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "json only user" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "json only assistant" }],
+    } as AgentMessage);
+
+    const engine = createEngine();
+    const sessionId = "bootstrap-reconcile-no-overlap";
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "db only user" } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: { role: "assistant", content: "db only assistant" } as AgentMessage,
+    });
+
+    const result = await engine.bootstrap({ sessionId, sessionFile });
+    expect(result.bootstrapped).toBe(false);
+    expect(result.importedMessages).toBe(0);
+    expect(result.reason).toBe("conversation already has messages");
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual(["db only user", "db only assistant"]);
+  });
+
+  it("uses the bulk import path for initial bootstrap", async () => {
+    const sessionFile = createSessionFilePath("bulk");
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "bulk one" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "bulk two" }],
+    } as AgentMessage);
+
+    const engine = createEngine();
+    const bulkSpy = vi.spyOn(engine.getConversationStore(), "createMessagesBulk");
+    const singleSpy = vi.spyOn(engine.getConversationStore(), "createMessage");
+
+    const result = await engine.bootstrap({
+      sessionId: "bootstrap-bulk",
+      sessionFile,
+    });
+
+    expect(result.bootstrapped).toBe(true);
+    expect(bulkSpy).toHaveBeenCalledTimes(1);
+    expect(singleSpy).not.toHaveBeenCalled();
+  });
+
+  it("streams JSONL replay and skips malformed lines while keeping later messages", async () => {
+    const sessionFile = createSessionFilePath("streaming-jsonl");
+    const lines: string[] = [];
+    for (let index = 0; index < 40; index += 1) {
+      const role = index % 2 === 0 ? "user" : "assistant";
+      lines.push(
+        JSON.stringify({
+          message: {
+            role,
+            content: [{ type: "text", text: `${role}-${index}` }],
+          },
+        }),
+      );
+      if (index === 17) {
+        lines.push("{ malformed json line");
+      }
+    }
+    writeFileSync(sessionFile, `${lines.join("\n")}\n`, "utf8");
+
+    const engine = createEngine();
+    const sessionId = "bootstrap-streaming-jsonl";
+
+    const result = await engine.bootstrap({ sessionId, sessionFile });
+    expect(result.bootstrapped).toBe(true);
+    expect(result.importedMessages).toBe(40);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(40);
+    expect(stored[0]?.content).toBe("user-0");
+    expect(stored[39]?.content).toBe("assistant-39");
+  });
+
+  it("prepareSubagentSpawn resolves parent conversation by sessionKey before UUID backfill", async () => {
+    const sessionKey = "agent:main:main";
+    const engine = createEngineWithDepsOverrides({
+      resolveSessionIdFromSessionKey: async () => "runtime-fresh",
+    });
+
+    await engine.ingest({
+      sessionId: "runtime-stale",
+      sessionKey,
+      message: makeMessage({ role: "assistant", content: "parent context" }),
+    });
+
+    const preparation = await engine.prepareSubagentSpawn({
+      parentSessionKey: sessionKey,
+      childSessionKey: "agent:main:subagent:test-child",
+    });
+
+    expect(preparation).toBeDefined();
+    preparation?.rollback();
+  });
+});
+
+// ── Assemble canonical path with fallback ───────────────────────────────────
+
+describe("LcmContextEngine.assemble canonical path", () => {
+  it("falls back to live messages when no DB conversation exists", async () => {
+    const engine = createEngine();
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: "first turn" },
+      { role: "assistant", content: "first reply" },
+    ] as AgentMessage[];
+
+    const result = await engine.assemble({
+      sessionId: "session-missing",
+      messages: liveMessages,
+      tokenBudget: 100,
+    });
+
+    expect(result.messages).toBe(liveMessages);
+    expect(result.estimatedTokens).toBe(0);
+  });
+
+  it("falls back when DB context clearly trails live context", async () => {
+    const engine = createEngine();
+    const sessionId = "session-incomplete";
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "persisted only one message" } as AgentMessage,
+    });
+
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: "live message 1" },
+      { role: "assistant", content: "live message 2" },
+      { role: "user", content: "live message 3" },
+    ] as AgentMessage[];
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: liveMessages,
+      tokenBudget: 256,
+    });
+
+    expect(result.messages).toBe(liveMessages);
+    expect(result.estimatedTokens).toBe(0);
+  });
+
+  it("assembles context from DB when coverage exists", async () => {
+    const engine = createEngine();
+    const sessionId = "session-canonical";
+
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "persisted message one" } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: { role: "assistant", content: "persisted message two" } as AgentMessage,
+    });
+
+    const liveMessages: AgentMessage[] = [{ role: "user", content: "live turn" }] as AgentMessage[];
+    const result = await engine.assemble({
+      sessionId,
+      messages: liveMessages,
+      tokenBudget: 10_000,
+    });
+
+    expect(result.messages).not.toBe(liveMessages);
+    expect(result.messages).toHaveLength(2);
+    expect(result.messages[0].role).toBe("user");
+    expect(result.messages[0].content).toBe("persisted message one");
+    expect(result.messages[1].role).toBe("assistant");
+    expect(result.estimatedTokens).toBeGreaterThan(0);
+  });
+
+  it("respects token budget in assembled output", async () => {
+    const engine = createEngine();
+    const sessionId = "session-budget";
+
+    for (let i = 0; i < 12; i++) {
+      await engine.ingest({
+        sessionId,
+        message: {
+          role: "user",
+          content: `turn ${i} ${"x".repeat(396)}`,
+        } as AgentMessage,
+      });
+    }
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: [{ role: "user", content: "live tail marker" }] as AgentMessage[],
+      tokenBudget: 500,
+    });
+
+    expect(result.messages.length).toBeLessThan(12);
+    expect(result.messages[0].content).not.toBe(`turn 0 ${"x".repeat(396)}`);
+  });
+
+  it("falls back to live messages if assembler throws", async () => {
+    const engine = createEngine();
+    const sessionId = "session-assemble-error";
+
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "persisted message" } as AgentMessage,
+    });
+
+    const originalAssembler = (engine as unknown as { assembler: { assemble: unknown } }).assembler;
+    (engine as unknown as { assembler: { assemble: () => Promise<never> } }).assembler = {
+      ...originalAssembler,
+      assemble: async () => {
+        throw new Error("boom");
+      },
+    };
+
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: "live fallback message" },
+    ] as AgentMessage[];
+    const result = await engine.assemble({
+      sessionId,
+      messages: liveMessages,
+      tokenBudget: 1000,
+    });
+
+    expect(result.messages).toBe(liveMessages);
+    expect(result.estimatedTokens).toBe(0);
+  });
+
+  it("drops orphan tool results during assembled transcript repair", async () => {
+    const engine = createEngine();
+    const sessionId = "session-orphan-tool-result";
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "toolResult",
+        toolCallId: "call_orphan",
+        content: [{ type: "tool_result", tool_use_id: "call_orphan", content: "ok" }],
+      } as AgentMessage,
+    });
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+
+    expect(result.messages).toEqual([]);
+  });
+
+  it("inserts synthetic tool results when assembled tool calls have no result", async () => {
+    const engine = createEngine();
+    const sessionId = "session-missing-tool-result";
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_2", name: "read", input: { path: "foo.txt" } }],
+      } as AgentMessage,
+    });
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+
+    expect(result.messages).toHaveLength(2);
+    expect(result.messages[0]?.role).toBe("assistant");
+    expect(result.messages[1]?.role).toBe("toolResult");
+    expect((result.messages[1] as { toolCallId?: string }).toolCallId).toBe("call_2");
+  });
+
+  it("repairs OpenAI function_call transcripts without dropping reasoning blocks", async () => {
+    const engine = createEngine();
+    const sessionId = "session-openai-function-call";
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "reasoning",
+            summary: [{ type: "summary_text", text: "Need to inspect the working directory." }],
+          },
+          {
+            type: "function_call",
+            call_id: "fc_1",
+            name: "bash",
+            arguments: '{"cmd":"pwd"}',
+          },
+        ],
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "interleaved user turn" } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "toolResult",
+        toolCallId: "fc_1",
+        toolName: "bash",
+        content: [{ type: "function_call_output", call_id: "fc_1", output: "/tmp" }],
+        isError: false,
+        timestamp: Date.now(),
+      } as AgentMessage,
+    });
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+
+    expect(result.messages).toHaveLength(3);
+
+    const assistant = result.messages[0] as {
+      role: string;
+      content?: Array<{ type?: string; call_id?: string }>;
+    };
+    expect(assistant.role).toBe("assistant");
+    expect(assistant.content?.map((block) => block.type)).toEqual(["reasoning", "function_call"]);
+    expect(assistant.content?.[1]?.call_id).toBe("fc_1");
+
+    expect(result.messages[1]?.role).toBe("toolResult");
+    expect((result.messages[1] as { toolCallId?: string }).toolCallId).toBe("fc_1");
+    expect(result.messages[2]?.role).toBe("user");
+  });
+
+  it("rebuilds raw function_call blocks from stored columns when raw arguments are objects", async () => {
+    const engine = createEngine();
+    const sessionId = "session-openai-function-call-raw-arguments-object";
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "function_call",
+            call_id: "fc_raw",
+            name: "bash",
+            arguments: '{"cmd":"pwd"}',
+          },
+        ],
+      } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const storedMessages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(storedMessages).toHaveLength(1);
+
+    const parts = await engine.getConversationStore().getMessageParts(storedMessages[0].messageId);
+    expect(parts).toHaveLength(1);
+
+    const db = (engine.getConversationStore() as unknown as {
+      db: { prepare: (sql: string) => { run: (metadata: string, partId: string) => void } };
+    }).db;
+
+    const metadata = JSON.parse(parts[0].metadata ?? "{}") as {
+      raw?: Record<string, unknown>;
+    };
+    expect(metadata.raw?.arguments).toBe('{"cmd":"pwd"}');
+    metadata.raw = {
+      ...(metadata.raw ?? {}),
+      arguments: { cmd: "pwd" },
+    };
+    db.prepare("UPDATE message_parts SET metadata = ? WHERE part_id = ?").run(
+      JSON.stringify(metadata),
+      parts[0].partId,
+    );
+
+    const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
+    const assembled = await assembler.assemble({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 10_000,
+    });
+
+    const assistant = assembled.messages[0] as {
+      role: string;
+      content?: Array<{ type?: string; call_id?: string; arguments?: unknown }>;
+    };
+    expect(assistant.role).toBe("assistant");
+    expect(assistant.content).toEqual([
+      {
+        type: "function_call",
+        call_id: "fc_raw",
+        name: "bash",
+        arguments: '{"cmd":"pwd"}',
+      },
+    ]);
+  });
+
+  it("omits dynamic LCM system prompt guidance when no summaries exist", async () => {
+    const engine = createEngine();
+    const sessionId = "session-no-summary-guidance";
+
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "plain context one" } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: { role: "assistant", content: "plain context two" } as AgentMessage,
+    });
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+
+    const promptAddition = (result as { systemPromptAddition?: string }).systemPromptAddition;
+    expect(promptAddition).toBeUndefined();
+  });
+
+  it("adds recall workflow guidance when summaries are present", async () => {
+    const engine = createEngine();
+    const sessionId = "session-summary-guidance";
+
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "seed message" } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    await engine.getSummaryStore().insertSummary({
+      summaryId: "sum_guidance_leaf",
+      conversationId: conversation!.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Leaf summary content",
+      tokenCount: 16,
+      descendantCount: 0,
+    });
+    await engine
+      .getSummaryStore()
+      .appendContextSummary(conversation!.conversationId, "sum_guidance_leaf");
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+
+    const promptAddition = (result as { systemPromptAddition?: string }).systemPromptAddition;
+    // Core recall section
+    expect(promptAddition).toContain("## LCM Recall");
+    expect(promptAddition).toContain("maps to details, not the details themselves");
+    expect(promptAddition).toContain("Use LCM tools first for compacted conversation history");
+    expect(promptAddition).toContain("prefer any available memory/recall tool");
+    expect(promptAddition).not.toContain("qmd");
+    expect(promptAddition).not.toContain("memory_search as last resort");
+    // Tool escalation
+    expect(promptAddition).toContain("1. `lcm_grep`");
+    expect(promptAddition).toContain("2. `lcm_describe`");
+    expect(promptAddition).toContain("3. `lcm_expand_query`");
+    // Usage patterns
+    expect(promptAddition).toContain("lcm_expand_query(summaryIds:");
+    expect(promptAddition).toContain("lcm_expand_query(query:");
+    // Expand for details footer guidance
+    expect(promptAddition).toContain("Expand for details about:");
+    // Shallow precision guidance (not full checklist)
+    expect(promptAddition).toContain("precision/evidence questions");
+    expect(promptAddition).toContain("Do not guess from condensed summaries");
+    // Should NOT include deep-compaction-specific content
+    expect(promptAddition).not.toContain("Uncertainty checklist");
+    expect(promptAddition).not.toContain("Deeply compacted context");
+  });
+
+  it("emphasizes expand-before-asserting when summaries are deeply compacted", async () => {
+    const engine = createEngine();
+    const sessionId = "session-deep-summary-guidance";
+
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "seed message" } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    await engine.getSummaryStore().insertSummary({
+      summaryId: "sum_guidance_deep",
+      conversationId: conversation!.conversationId,
+      kind: "condensed",
+      depth: 2,
+      content: "Deep condensed summary",
+      tokenCount: 24,
+      descendantCount: 12,
+    });
+    await engine
+      .getSummaryStore()
+      .appendContextSummary(conversation!.conversationId, "sum_guidance_deep");
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+
+    const promptAddition = (result as { systemPromptAddition?: string }).systemPromptAddition;
+    // Deep-specific guidance
+    expect(promptAddition).toContain("Deeply compacted context");
+    expect(promptAddition).toContain("expand before asserting specifics");
+    // Full recall flow
+    expect(promptAddition).toContain("1) `lcm_grep` to locate relevant summary/message IDs");
+    expect(promptAddition).toContain("2) `lcm_expand_query` with a focused prompt");
+    expect(promptAddition).toContain("3) Answer with citations to summary IDs used");
+    // Uncertainty checklist
+    expect(promptAddition).toContain("Uncertainty checklist");
+    expect(promptAddition).toContain("Am I making exact factual claims from a condensed summary?");
+    expect(promptAddition).toContain("Could compaction have omitted a crucial detail?");
+    // Refusal-to-guess
+    expect(promptAddition).toContain("Do not guess");
+    expect(promptAddition).toContain("Expand first or state that you need to expand");
+  });
+});
+
+describe("LcmContextEngine fidelity and token budget", () => {
+  it("normalizes tool_result blocks without inflating stored token accounting", async () => {
+    // Verify that tool_result blocks with large raw metadata blobs are
+    // normalized through toolResultBlockFromPart rather than returned
+    // verbatim. Raw metadata should NOT leak into the assembled payload —
+    // only the dedicated part columns (toolOutput, textContent) matter.
+    const engine = createEngine();
+    const sessionId = randomUUID();
+    const rawBlob = "x".repeat(24_000);
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "call_large_raw", name: "read", input: { path: "foo.txt" } },
+        ],
+      } as AgentMessage,
+    });
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "toolResult",
+        toolCallId: "call_large_raw",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "call_large_raw",
+            metadata: {
+              raw: rawBlob,
+              details: { payload: rawBlob.slice(0, 8_000) },
+            },
+          },
+        ],
+      } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const contextTokens = await engine
+      .getSummaryStore()
+      .getContextTokenCount(conversation!.conversationId);
+    const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
+    const assembled = await assembler.assemble({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 500_000,
+    });
+    const assembledPayloadTokens = estimateAssembledPayloadTokens(assembled.messages);
+
+    // The assembled payload should be small — the 24K raw metadata blob
+    // must NOT appear in the output. Tool results use dedicated columns,
+    // not the raw metadata object.
+    expect(contextTokens).toBe(assembledPayloadTokens);
+    expect(assembledPayloadTokens).toBeLessThan(500);
+  });
+
+  it("preserves structured toolResult content via message_parts and assembler", async () => {
+    const engine = createEngine();
+    const sessionId = randomUUID();
+    const assistantToolCall = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "call_123", name: "read", input: { path: "foo.txt" } }],
+    } as AgentMessage;
+    const toolResult = {
+      role: "toolResult",
+      toolCallId: "call_123",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "call_123",
+          content: [{ type: "text", text: "command output" }],
+        },
+      ],
+    } as AgentMessage;
+
+    await engine.ingest({
+      sessionId,
+      message: assistantToolCall,
+    });
+
+    await engine.ingest({
+      sessionId,
+      message: toolResult,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const storedMessages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(storedMessages).toHaveLength(2);
+    expect(storedMessages[1].role).toBe("tool");
+
+    const parts = await engine.getConversationStore().getMessageParts(storedMessages[1].messageId);
+    expect(parts).toHaveLength(1);
+    expect(parts[0].partType).toBe("tool");
+    expect(parts[0].toolCallId).toBe("call_123");
+
+    const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
+    const assembled = await assembler.assemble({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 10_000,
+    });
+    expect(assembled.messages).toHaveLength(2);
+    expect(assembled.messages[0]?.role).toBe("assistant");
+
+    const assembledMessage = assembled.messages[1] as {
+      role: string;
+      toolCallId?: string;
+      content?: unknown;
+    };
+    expect(assembledMessage.role).toBe("toolResult");
+    expect(assembledMessage.toolCallId).toBe("call_123");
+    expect(Array.isArray(assembledMessage.content)).toBe(true);
+    expect((assembledMessage.content as Array<{ type?: string }>)[0]?.type).toBe("tool_result");
+    expect(
+      (assembledMessage.content as Array<{ content?: unknown }>)[0]?.content,
+    ).toEqual([{ type: "text", text: "command output" }]);
+  });
+
+  it("does not leak OpenAI function tool payloads into stored message content fallbacks", async () => {
+    const engine = createEngine();
+    const sessionId = randomUUID();
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [
+          { type: "function_call", call_id: "fc_only", name: "bash", arguments: '{"cmd":"pwd"}' },
+        ],
+      } as AgentMessage,
+    });
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "toolResult",
+        toolCallId: "fc_only",
+        toolName: "bash",
+        content: [{ type: "function_call_output", call_id: "fc_only", output: "/tmp" }],
+        isError: false,
+      } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const storedMessages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(storedMessages).toHaveLength(2);
+    expect(storedMessages[0]?.content).toBe("");
+    expect(storedMessages[1]?.content).toBe("");
+
+    const assembled = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+    const assistant = assembled.messages[0] as { content?: Array<{ type?: string }> };
+    const toolResult = assembled.messages[1] as { content?: Array<{ type?: string }> };
+    expect(assistant.content?.[0]?.type).toBe("function_call");
+    expect(toolResult.content?.[0]?.type).toBe("function_call_output");
+  });
+
+  it("preserves toolName through ingest-assemble round-trip for Gemini compatibility", async () => {
+    const engine = createEngine();
+    const sessionId = randomUUID();
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_456", name: "bash", input: { command: "ls" } }],
+      } as AgentMessage,
+    });
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "toolResult",
+        toolCallId: "call_456",
+        toolName: "bash",
+        content: [{ type: "text", text: "file1.txt\nfile2.txt" }],
+        isError: false,
+      } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const storedMessages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    const parts = await engine
+      .getConversationStore()
+      .getMessageParts(storedMessages[1].messageId);
+    expect(parts[0].toolName).toBe("bash");
+
+    const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
+    const assembled = await assembler.assemble({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 10_000,
+    });
+
+    const result = assembled.messages[1] as {
+      role: string;
+      toolCallId?: string;
+      toolName?: string;
+      isError?: boolean;
+    };
+    expect(result.role).toBe("toolResult");
+    expect(result.toolCallId).toBe("call_456");
+    expect(result.toolName).toBe("bash");
+    expect(result.isError).toBe(false);
+  });
+
+  it("preserves toolResult error state through ingest-assemble round-trip", async () => {
+    const engine = createEngine();
+    const sessionId = randomUUID();
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_457", name: "bash", input: { command: "false" } }],
+      } as AgentMessage,
+    });
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "toolResult",
+        toolCallId: "call_457",
+        toolName: "bash",
+        content: [{ type: "text", text: "command failed" }],
+        isError: true,
+      } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const storedMessages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    const parts = await engine
+      .getConversationStore()
+      .getMessageParts(storedMessages[1].messageId);
+    expect(JSON.parse(parts[0].metadata ?? "{}")).toMatchObject({ isError: true });
+
+    const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
+    const assembled = await assembler.assemble({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 10_000,
+    });
+
+    const result = assembled.messages[1] as {
+      role: string;
+      toolCallId?: string;
+      toolName?: string;
+      isError?: boolean;
+    };
+    expect(result.role).toBe("toolResult");
+    expect(result.toolCallId).toBe("call_457");
+    expect(result.toolName).toBe("bash");
+    expect(result.isError).toBe(true);
+  });
+
+  it("preserves top-level tool metadata for string-content tool results", async () => {
+    const engine = createEngine();
+    const sessionId = randomUUID();
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_458", name: "bash", input: { command: "pwd" } }],
+      } as AgentMessage,
+    });
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "toolResult",
+        toolCallId: "call_458",
+        toolName: "bash",
+        content: "/tmp/project",
+        isError: false,
+      } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const storedMessages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    const parts = await engine
+      .getConversationStore()
+      .getMessageParts(storedMessages[1].messageId);
+    expect(parts[0].partType).toBe("text");
+    expect(JSON.parse(parts[0].metadata ?? "{}")).toMatchObject({
+      toolCallId: "call_458",
+      toolName: "bash",
+      isError: false,
+    });
+
+    const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
+    const assembled = await assembler.assemble({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 10_000,
+    });
+
+    const result = assembled.messages[1] as {
+      role: string;
+      toolCallId?: string;
+      toolName?: string;
+      isError?: boolean;
+      content?: unknown;
+    };
+    expect(result.role).toBe("toolResult");
+    expect(result.toolCallId).toBe("call_458");
+    expect(result.toolName).toBe("bash");
+    expect(result.isError).toBe(false);
+    expect(result.content).toEqual([{ type: "text", text: "/tmp/project" }]);
+  });
+
+  it("reconstructs OpenAI reasoning and function call blocks when raw metadata is missing", async () => {
+    const engine = createEngine();
+    const sessionId = randomUUID();
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "reasoning",
+            summary: [{ type: "summary_text", text: "Need shell output before replying." }],
+          },
+          {
+            type: "function_call",
+            call_id: "fc_2",
+            name: "bash",
+            arguments: '{"cmd":"pwd"}',
+          },
+        ],
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "toolResult",
+        toolCallId: "fc_2",
+        toolName: "bash",
+        content: [{ type: "function_call_output", call_id: "fc_2", output: { cwd: "/tmp" } }],
+        isError: false,
+        timestamp: Date.now(),
+      } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const storedMessages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(storedMessages).toHaveLength(2);
+
+    const assistantParts = await engine
+      .getConversationStore()
+      .getMessageParts(storedMessages[0].messageId);
+    expect(assistantParts.map((part) => part.partType)).toEqual(["reasoning", "tool"]);
+    expect(assistantParts[1].toolCallId).toBe("fc_2");
+
+    const toolResultParts = await engine
+      .getConversationStore()
+      .getMessageParts(storedMessages[1].messageId);
+    expect(toolResultParts).toHaveLength(1);
+    expect(toolResultParts[0].partType).toBe("tool");
+    expect(toolResultParts[0].toolCallId).toBe("fc_2");
+
+    const db = (engine.getConversationStore() as unknown as {
+      db: { prepare: (sql: string) => { run: (metadata: string, partId: string) => void } };
+    }).db;
+
+    for (const part of [...assistantParts, ...toolResultParts]) {
+      const metadata = JSON.parse(part.metadata ?? "{}") as Record<string, unknown>;
+      delete metadata.raw;
+      db.prepare("UPDATE message_parts SET metadata = ? WHERE part_id = ?").run(
+        JSON.stringify(metadata),
+        part.partId,
+      );
+    }
+
+    const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
+    const assembled = await assembler.assemble({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 10_000,
+    });
+
+    expect(assembled.messages).toHaveLength(2);
+
+    const assistant = assembled.messages[0] as {
+      role: string;
+      content?: Array<{ type?: string; text?: string; call_id?: string; arguments?: unknown }>;
+    };
+    expect(assistant.role).toBe("assistant");
+    expect(assistant.content?.map((block) => block.type)).toEqual(["reasoning", "function_call"]);
+    expect(assistant.content?.[0]?.text).toBe("Need shell output before replying.");
+    expect(assistant.content?.[1]?.call_id).toBe("fc_2");
+    expect(assistant.content?.[1]?.arguments).toBe('{"cmd":"pwd"}');
+
+    const toolResult = assembled.messages[1] as {
+      role: string;
+      toolCallId?: string;
+      content?: Array<{ type?: string; call_id?: string; output?: unknown }>;
+    };
+    expect(toolResult.role).toBe("toolResult");
+    expect(toolResult.toolCallId).toBe("fc_2");
+    expect(toolResult.content?.[0]?.type).toBe("function_call_output");
+    expect(toolResult.content?.[0]?.call_id).toBe("fc_2");
+    expect(toolResult.content?.[0]?.output).toEqual({ cwd: "/tmp" });
+  });
+
+  it("maps unknown roles to assistant instead of silently coercing to user", async () => {
+    const engine = createEngine();
+    const sessionId = randomUUID();
+
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "custom-event", content: "opaque payload" }),
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const storedMessages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(storedMessages).toHaveLength(1);
+    expect(storedMessages[0].role).toBe("assistant");
+  });
+
+  it("uses explicit compact tokenBudget over legacy tokenBudget", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (conversationId: number, tokenBudget: number) => Promise<unknown>;
+        compactUntilUnder: (input: unknown) => Promise<unknown>;
+      };
+    };
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "none",
+      currentTokens: 12,
+      threshold: 9,
+    });
+    const compactSpy = vi.spyOn(privateEngine.compaction, "compactUntilUnder");
+
+    await engine.ingest({
+      sessionId: "budget-session",
+      message: makeMessage({ role: "user", content: "hello world" }),
+    });
+
+    const result = await engine.compact({
+      sessionId: "budget-session",
+      sessionFile: "/tmp/unused.jsonl",
+      tokenBudget: 123,
+      legacyParams: { tokenBudget: 999 },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.compacted).toBe(false);
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 123);
+    expect(compactSpy).not.toHaveBeenCalled();
+  });
+
+  it("ingests completed turn batches with ingestBatch", async () => {
+    const engine = createEngine();
+    const sessionId = "batch-ingest-session";
+    const messages: AgentMessage[] = [
+      makeMessage({ role: "user", content: "turn user 1" }),
+      makeMessage({ role: "assistant", content: "turn assistant 1" }),
+      makeMessage({ role: "user", content: "turn user 2" }),
+    ];
+
+    const result = await engine.ingestBatch({
+      sessionId,
+      messages,
+    });
+    expect(result.ingestedCount).toBe(3);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    expect(await engine.getConversationStore().getMessageCount(conversation!.conversationId)).toBe(
+      3,
+    );
+    expect(
+      (await engine.getSummaryStore().getContextItems(conversation!.conversationId)).length,
+    ).toBe(3);
+  });
+
+  it("skips heartbeat turn batches in ingestBatch", async () => {
+    const engine = createEngine();
+    const sessionId = "batch-ingest-heartbeat-session";
+
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "user", content: "keep this turn" }),
+    });
+
+    const heartbeatBatch: AgentMessage[] = [
+      makeMessage({ role: "user", content: "heartbeat poll: pending" }),
+      makeMessage({ role: "assistant", content: "worker snapshot: large payload" }),
+    ];
+
+    const result = await engine.ingestBatch({
+      sessionId,
+      messages: heartbeatBatch,
+      isHeartbeat: true,
+    });
+
+    expect(result.ingestedCount).toBe(0);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    expect(await engine.getConversationStore().getMessageCount(conversation!.conversationId)).toBe(
+      1,
+    );
+    expect(
+      (await engine.getSummaryStore().getContextItems(conversation!.conversationId)).length,
+    ).toBe(1);
+
+    const assembled = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+
+    const assembledText = assembled.messages
+      .map((message) => (typeof message.content === "string" ? message.content : ""))
+      .join("\n");
+    expect(assembledText).toContain("keep this turn");
+    expect(assembledText).not.toContain("heartbeat poll");
+    expect(assembledText).not.toContain("worker snapshot");
+  });
+
+  it("afterTurn ingests auto-compaction summary and new turn messages", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-ingest";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-ingest"),
+      messages: [
+        makeMessage({ role: "user", content: "already present before prompt" }),
+        makeMessage({ role: "assistant", content: "new assistant reply" }),
+      ],
+      prePromptMessageCount: 1,
+      autoCompactionSummary: "[summary] compacted older history",
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "[summary] compacted older history",
+      "new assistant reply",
+    ]);
+  });
+
+  it("afterTurn deduplicates replayed history before prepending auto-compaction summary", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-summary-replay";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-summary-replay-seed"),
+      messages: [
+        makeMessage({ role: "user", content: "old question" }),
+        makeMessage({ role: "assistant", content: "old answer" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-summary-replay"),
+      messages: [
+        makeMessage({ role: "system", content: "system prompt" }),
+        makeMessage({ role: "user", content: "old question" }),
+        makeMessage({ role: "assistant", content: "old answer" }),
+        makeMessage({ role: "user", content: "new question" }),
+        makeMessage({ role: "assistant", content: "new answer" }),
+      ],
+      prePromptMessageCount: 1,
+      autoCompactionSummary: "[summary] compacted older history",
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "old question",
+      "old answer",
+      "[summary] compacted older history",
+      "new question",
+      "new answer",
+    ]);
+  });
+
+  it("afterTurn runs proactive threshold compaction when tokenBudget is provided", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-proactive-compact";
+
+    const evaluateLeafTriggerSpy = vi.spyOn(engine, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: false,
+      rawTokensOutsideTail: 0,
+      threshold: 20_000,
+    });
+    const compactLeafAsyncSpy = vi.spyOn(engine, "compactLeafAsync");
+    const compactSpy = vi.spyOn(engine, "compact").mockResolvedValue({
+      ok: true,
+      compacted: false,
+      reason: "below threshold",
+      result: {
+        tokensBefore: 42,
+      },
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-proactive-compact"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    expect(evaluateLeafTriggerSpy).toHaveBeenCalledWith(sessionId, undefined);
+    expect(compactLeafAsyncSpy).not.toHaveBeenCalled();
+    expect(compactSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId,
+        tokenBudget: 4096,
+        compactionTarget: "threshold",
+      }),
+    );
+  });
+
+  it("afterTurn resolves tokenBudget from runtimeContext and forwards it as legacyParams", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-runtime-context";
+    const runtimeContext = { provider: "anthropic", model: "claude-opus-4-5", tokenBudget: 2048 };
+
+    vi.spyOn(engine, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: true,
+      rawTokensOutsideTail: 20_000,
+      threshold: 20_000,
+    });
+    const compactLeafAsyncSpy = vi.spyOn(engine, "compactLeafAsync").mockResolvedValue({
+      ok: true,
+      compacted: false,
+      reason: "below threshold",
+    });
+    const compactSpy = vi.spyOn(engine, "compact").mockResolvedValue({
+      ok: true,
+      compacted: false,
+      reason: "below threshold",
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-runtime-context"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      runtimeContext,
+    });
+
+    expect(compactLeafAsyncSpy).toHaveBeenCalled();
+    expect((compactLeafAsyncSpy.mock.calls[0]?.[0] as { tokenBudget?: unknown }).tokenBudget).toBe(2048);
+    expect((compactLeafAsyncSpy.mock.calls[0]?.[0] as { legacyParams?: unknown }).legacyParams).toBe(
+      runtimeContext,
+    );
+    expect(compactSpy).toHaveBeenCalled();
+    expect((compactSpy.mock.calls[0]?.[0] as { tokenBudget?: unknown }).tokenBudget).toBe(2048);
+    expect((compactSpy.mock.calls[0]?.[0] as { legacyParams?: unknown }).legacyParams).toBe(
+      runtimeContext,
+    );
+  });
+
+  it("afterTurn falls back to the default token budget when no budget is provided", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-default-token-budget";
+    const consoleWarnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    vi.spyOn(engine, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: false,
+      rawTokensOutsideTail: 0,
+      threshold: 20_000,
+    });
+    const compactSpy = vi.spyOn(engine, "compact").mockResolvedValue({
+      ok: true,
+      compacted: false,
+      reason: "below threshold",
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-default-token-budget"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+    });
+
+    expect(compactSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId,
+        tokenBudget: 128_000,
+        compactionTarget: "threshold",
+      }),
+    );
+    expect(consoleWarnSpy).toHaveBeenCalledWith(
+      "[lcm] afterTurn: tokenBudget not provided; using default 128000",
+    );
+
+    consoleWarnSpy.mockRestore();
+  });
+
+  it("afterTurn falls back to legacyCompactionParams when runtimeContext is missing", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-legacy-compaction-params";
+    const legacyCompactionParams = { provider: "anthropic", model: "claude-opus-4-5" };
+
+    vi.spyOn(engine, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: true,
+      rawTokensOutsideTail: 20_000,
+      threshold: 20_000,
+    });
+    const compactLeafAsyncSpy = vi.spyOn(engine, "compactLeafAsync").mockResolvedValue({
+      ok: true,
+      compacted: false,
+      reason: "below threshold",
+    });
+    const compactSpy = vi.spyOn(engine, "compact").mockResolvedValue({
+      ok: true,
+      compacted: false,
+      reason: "below threshold",
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-legacy-compaction-params"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+      legacyCompactionParams,
+    });
+
+    expect(compactLeafAsyncSpy).toHaveBeenCalled();
+    expect((compactLeafAsyncSpy.mock.calls[0]?.[0] as { legacyParams?: unknown }).legacyParams).toBe(
+      legacyCompactionParams,
+    );
+    expect(compactSpy).toHaveBeenCalled();
+    expect((compactSpy.mock.calls[0]?.[0] as { legacyParams?: unknown }).legacyParams).toBe(
+      legacyCompactionParams,
+    );
+  });
+
+  it("afterTurn prefers runtimeContext when both runtimeContext and legacyCompactionParams are set", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-runtime-context-priority";
+    const runtimeContext = { provider: "anthropic", model: "claude-opus-4-5", source: "rt" };
+    const legacyCompactionParams = {
+      provider: "anthropic",
+      model: "claude-opus-4-5",
+      source: "legacy",
+    };
+
+    vi.spyOn(engine, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: false,
+      rawTokensOutsideTail: 0,
+      threshold: 20_000,
+    });
+    const compactSpy = vi.spyOn(engine, "compact").mockResolvedValue({
+      ok: true,
+      compacted: false,
+      reason: "below threshold",
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-runtime-context-priority"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+      runtimeContext,
+      legacyCompactionParams,
+    });
+
+    expect((compactSpy.mock.calls[0]?.[0] as { legacyParams?: unknown }).legacyParams).toBe(
+      runtimeContext,
+    );
+  });
+
+  it("afterTurn skips compaction when ingest fails", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-ingest-failure";
+
+    const ingestBatchSpy = vi
+      .spyOn(engine, "ingestBatch")
+      .mockRejectedValue(new Error("ingest exploded"));
+    const evaluateLeafTriggerSpy = vi.spyOn(engine, "evaluateLeafTrigger");
+    const compactLeafAsyncSpy = vi.spyOn(engine, "compactLeafAsync");
+    const compactSpy = vi.spyOn(engine, "compact");
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-ingest-failure"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    expect(ingestBatchSpy).toHaveBeenCalled();
+    expect(evaluateLeafTriggerSpy).not.toHaveBeenCalled();
+    expect(compactLeafAsyncSpy).not.toHaveBeenCalled();
+    expect(compactSpy).not.toHaveBeenCalled();
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      "[lcm] afterTurn: ingest failed, skipping compaction:",
+      "ingest exploded",
+    );
+
+    consoleErrorSpy.mockRestore();
+  });
+});
+
+// ── Compact token budget plumbing ───────────────────────────────────────────
+
+describe("LcmContextEngine.compact token budget plumbing", () => {
+  it("fails when compact token budget is missing", async () => {
+    const engine = createEngine();
+    const sessionId = "session-missing-budget";
+
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "hello compact" } as AgentMessage,
+    });
+
+    const result = await engine.compact({
+      sessionId,
+      sessionFile: "/tmp/session.jsonl",
+      legacyParams: {
+        provider: "anthropic",
+        model: "claude-opus-4-5",
+      },
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.compacted).toBe(false);
+    expect(result.reason).toContain("missing token budget");
+  });
+
+  it("reads tokenBudget and currentTokenCount from runtimeContext", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+        compactFullSweep: (input: unknown) => Promise<unknown>;
+      };
+    };
+
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      currentTokens: 500,
+      threshold: 300,
+    });
+    const compactFullSweepSpy = vi
+      .spyOn(privateEngine.compaction, "compactFullSweep")
+      .mockResolvedValue({
+        actionTaken: true,
+        tokensBefore: 500,
+        tokensAfter: 280,
+        condensed: false,
+      });
+
+    await engine.ingest({
+      sessionId: "runtime-context-token-session",
+      message: { role: "user", content: "trigger" } as AgentMessage,
+    });
+
+    const result = await engine.compact({
+      sessionId: "runtime-context-token-session",
+      sessionFile: "/tmp/session.jsonl",
+      runtimeContext: {
+        tokenBudget: 400,
+        currentTokenCount: 500,
+      },
+      compactionTarget: "threshold",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.compacted).toBe(true);
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 400, 500);
+    expect(compactFullSweepSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: expect.any(Number),
+        tokenBudget: 400,
+        summarize: expect.any(Function),
+        force: false,
+        hardTrigger: false,
+      }),
+    );
+  });
+
+  it("forces one compaction round for manual compaction requests in runtimeContext", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (conversationId: number, tokenBudget: number) => Promise<unknown>;
+        compactFullSweep: (input: unknown) => Promise<unknown>;
+        compactUntilUnder: (input: unknown) => Promise<unknown>;
+      };
+    };
+
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "none",
+      currentTokens: 116_000,
+      threshold: 150_000,
+    });
+    const compactFullSweepSpy = vi
+      .spyOn(privateEngine.compaction, "compactFullSweep")
+      .mockResolvedValue({
+        actionTaken: true,
+        tokensBefore: 116_000,
+        tokensAfter: 92_000,
+        condensed: false,
+      });
+    const compactUntilUnderSpy = vi.spyOn(privateEngine.compaction, "compactUntilUnder");
+
+    await engine.ingest({
+      sessionId: "manual-compact-runtime-context",
+      message: { role: "user", content: "trigger manual compact" } as AgentMessage,
+    });
+
+    const result = await engine.compact({
+      sessionId: "manual-compact-runtime-context",
+      sessionFile: "/tmp/session.jsonl",
+      runtimeContext: {
+        tokenBudget: 200_000,
+        manualCompaction: true,
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.compacted).toBe(true);
+    expect(result.reason).toBe("compacted");
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 200_000);
+    expect(compactFullSweepSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: expect.any(Number),
+        tokenBudget: 200_000,
+        summarize: expect.any(Function),
+        force: true,
+        hardTrigger: false,
+      }),
+    );
+    expect(compactUntilUnderSpy).not.toHaveBeenCalled();
+  });
+
+  it("prefers runtimeContext over legacyParams when both are provided", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (conversationId: number, tokenBudget: number) => Promise<unknown>;
+        compactUntilUnder: (input: unknown) => Promise<unknown>;
+      };
+    };
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "none",
+      currentTokens: 12,
+      threshold: 9,
+    });
+    const compactSpy = vi.spyOn(privateEngine.compaction, "compactUntilUnder");
+
+    await engine.ingest({
+      sessionId: "runtime-context-priority-session",
+      message: makeMessage({ role: "user", content: "hello world" }),
+    });
+
+    const result = await engine.compact({
+      sessionId: "runtime-context-priority-session",
+      sessionFile: "/tmp/unused.jsonl",
+      runtimeContext: { tokenBudget: 123 },
+      legacyParams: { tokenBudget: 999 },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.compacted).toBe(false);
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 123);
+    expect(compactSpy).not.toHaveBeenCalled();
+  });
+
+  it("accepts explicit token budget without falling back to defaults", async () => {
+    const engine = createEngineWithConfig({ contextThreshold: 0.9 });
+    const sessionId = "session-explicit-budget";
+
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "small message" } as AgentMessage,
+    });
+
+    const result = await engine.compact({
+      sessionId,
+      sessionFile: "/tmp/session.jsonl",
+      legacyParams: {
+        tokenBudget: 10_000,
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.compacted).toBe(false);
+    expect(result.reason).toBe("below threshold");
+  });
+
+  it("forces one compaction round for manual compaction requests", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (conversationId: number, tokenBudget: number) => Promise<unknown>;
+        compactFullSweep: (input: unknown) => Promise<unknown>;
+        compactUntilUnder: (input: unknown) => Promise<unknown>;
+      };
+    };
+
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "none",
+      currentTokens: 116_000,
+      threshold: 150_000,
+    });
+    const compactFullSweepSpy = vi
+      .spyOn(privateEngine.compaction, "compactFullSweep")
+      .mockResolvedValue({
+        actionTaken: true,
+        tokensBefore: 116_000,
+        tokensAfter: 92_000,
+        condensed: false,
+      });
+    const compactUntilUnderSpy = vi.spyOn(privateEngine.compaction, "compactUntilUnder");
+
+    await engine.ingest({
+      sessionId: "manual-compact-session",
+      message: { role: "user", content: "trigger manual compact" } as AgentMessage,
+    });
+
+    const result = await engine.compact({
+      sessionId: "manual-compact-session",
+      sessionFile: "/tmp/session.jsonl",
+      tokenBudget: 200_000,
+      legacyParams: {
+        manualCompaction: true,
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.compacted).toBe(true);
+    expect(result.reason).toBe("compacted");
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 200_000);
+    expect(compactFullSweepSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: expect.any(Number),
+        tokenBudget: 200_000,
+        summarize: expect.any(Function),
+        force: true,
+        hardTrigger: false,
+      }),
+    );
+    expect(compactUntilUnderSpy).not.toHaveBeenCalled();
+  });
+
+  it("uses threshold target for proactive threshold compaction mode", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (conversationId: number, tokenBudget: number) => Promise<unknown>;
+        compactFullSweep: (input: unknown) => Promise<unknown>;
+        compactUntilUnder: (input: unknown) => Promise<unknown>;
+      };
+    };
+
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      currentTokens: 380,
+      threshold: 300,
+    });
+    const compactFullSweepSpy = vi
+      .spyOn(privateEngine.compaction, "compactFullSweep")
+      .mockResolvedValue({
+        actionTaken: true,
+        tokensBefore: 380,
+        tokensAfter: 280,
+        condensed: false,
+      });
+
+    await engine.ingest({
+      sessionId: "threshold-target-session",
+      message: { role: "user", content: "trigger" } as AgentMessage,
+    });
+
+    const result = await engine.compact({
+      sessionId: "threshold-target-session",
+      sessionFile: "/tmp/session.jsonl",
+      tokenBudget: 400,
+      compactionTarget: "threshold",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.compacted).toBe(true);
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 400);
+    expect(compactFullSweepSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: expect.any(Number),
+        tokenBudget: 400,
+        summarize: expect.any(Function),
+        force: false,
+        hardTrigger: false,
+      }),
+    );
+  });
+
+  it("passes currentTokenCount through to compaction evaluation and loop", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+        compactFullSweep: (input: unknown) => Promise<unknown>;
+        compactUntilUnder: (input: unknown) => Promise<unknown>;
+      };
+    };
+
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      currentTokens: 500,
+      threshold: 300,
+    });
+    const compactFullSweepSpy = vi
+      .spyOn(privateEngine.compaction, "compactFullSweep")
+      .mockResolvedValue({
+        actionTaken: true,
+        tokensBefore: 500,
+        tokensAfter: 280,
+        condensed: false,
+      });
+
+    await engine.ingest({
+      sessionId: "observed-token-session",
+      message: { role: "user", content: "trigger" } as AgentMessage,
+    });
+
+    const result = await engine.compact({
+      sessionId: "observed-token-session",
+      sessionFile: "/tmp/session.jsonl",
+      tokenBudget: 400,
+      currentTokenCount: 500,
+      compactionTarget: "threshold",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.compacted).toBe(true);
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 400, 500);
+    expect(compactFullSweepSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: expect.any(Number),
+        tokenBudget: 400,
+        summarize: expect.any(Function),
+        force: false,
+        hardTrigger: false,
+      }),
+    );
+  });
+
+  it("reports already under target when compaction rounds are zero", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (conversationId: number, tokenBudget: number) => Promise<unknown>;
+        compactUntilUnder: (input: unknown) => Promise<unknown>;
+      };
+    };
+
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      currentTokens: 2_050,
+      threshold: 1_500,
+    });
+    vi.spyOn(privateEngine.compaction, "compactUntilUnder").mockResolvedValue({
+      success: true,
+      rounds: 0,
+      finalTokens: 2_000,
+    });
+
+    await engine.ingest({
+      sessionId: "under-target-session",
+      message: { role: "user", content: "trigger" } as AgentMessage,
+    });
+
+    const result = await engine.compact({
+      sessionId: "under-target-session",
+      sessionFile: "/tmp/session.jsonl",
+      tokenBudget: 2_000,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.compacted).toBe(false);
+    expect(result.reason).toBe("already under target");
+  });
+
+  it("reports live overflow when a forced sweep cannot compact stored context", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+        compactFullSweep: (input: unknown) => Promise<unknown>;
+      };
+    };
+
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      currentTokens: 277_403,
+      threshold: 150_000,
+    });
+    vi.spyOn(privateEngine.compaction, "compactFullSweep").mockResolvedValue({
+      actionTaken: false,
+      tokensBefore: 17_561,
+      tokensAfter: 17_561,
+      condensed: false,
+    });
+
+    await engine.ingest({
+      sessionId: "forced-sweep-live-overflow",
+      message: { role: "user", content: "trigger" } as AgentMessage,
+    });
+
+    const result = await engine.compact({
+      sessionId: "forced-sweep-live-overflow",
+      sessionFile: "/tmp/session.jsonl",
+      tokenBudget: 200_000,
+      currentTokenCount: 277_403,
+      force: true,
+      compactionTarget: "budget",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.compacted).toBe(false);
+    expect(result.reason).toBe("live context still exceeds target");
+    expect(result.result?.tokensBefore).toBe(277_403);
+    expect(result.result?.tokensAfter).toBe(17_561);
+    expect(result.result?.details).toEqual(
+      expect.objectContaining({
+        rounds: 0,
+        targetTokens: 200_000,
+      }),
+    );
+  });
+});
